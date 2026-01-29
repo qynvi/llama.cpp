@@ -83,11 +83,11 @@ int main(int argc, char ** argv) {
         params.n_batch = params.n_ubatch;
     }
 
-    if (params.n_parallel < 0) {
-        LOG_INF("%s: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n", __func__);
-
-        params.n_parallel = 4;
-        params.kv_unified = true;
+    // Force single-slot mode for soft thinking support
+    // Multiple slots would require complex batching logic to handle embedding vs token batches
+    if (params.n_parallel != 1) {
+        LOG_INF("%s: forcing n_parallel = 1 for soft thinking compatibility (was %d)\n", __func__, params.n_parallel);
+        params.n_parallel = 1;
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

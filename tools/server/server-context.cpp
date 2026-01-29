@@ -9,6 +9,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "soft_thinking.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -161,6 +162,13 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    // Soft thinking state
+    soft_thinking_context st_ctx;
+    soft_thinking_params  st_params;
+    bool                  soft_thinking_active = false;  // Whether soft thinking is active for current request
+    float *               soft_embd = nullptr;           // Current soft embedding (points to st_ctx buffer)
+    bool                  soft_embd_decoded = false;     // Whether we just decoded a soft embedding (needs sampling)
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -183,6 +191,12 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        // reset soft thinking state
+        soft_thinking_reset(st_ctx);
+        soft_thinking_active = false;
+        soft_embd = nullptr;
+        soft_embd_decoded = false;
 
         task_prev = std::move(task);
         task.reset();
@@ -766,6 +780,32 @@ private:
                 queue_tasks.pop_deferred_task(slot_id);
             };
 
+            // Initialize soft thinking params from global params
+            if (params_base.soft_thinking) {
+                slot.st_params.enabled = true;
+                slot.st_params.sampler = params_base.soft_thinking_sampler;
+                slot.st_params.top_k = params_base.soft_thinking_top_k;
+                slot.st_params.entropy_frac = params_base.soft_thinking_entropy_frac;
+                slot.st_params.min_k = params_base.soft_thinking_min_k;
+                slot.st_params.max_k = params_base.soft_thinking_max_k;
+                slot.st_params.entropy_threshold = params_base.soft_thinking_entropy_thr;
+                slot.st_params.cold_stop_steps = params_base.soft_thinking_cold_steps;
+                // Mixture sharpening params (Fix 3) - adaptive by default
+                slot.st_params.adaptive_alpha = params_base.soft_thinking_adaptive_alpha;
+                slot.st_params.alpha_low = params_base.soft_thinking_alpha_low;
+                slot.st_params.alpha_high = params_base.soft_thinking_alpha_high;
+                // Token class filtering params (Fix 4) - enabled by default
+                slot.st_params.class_filtering = params_base.soft_thinking_class_filter;
+
+                soft_thinking_init(slot.st_ctx, model, slot.st_params);
+
+                SLT_INF(slot, "soft thinking enabled: sampler=%s, alpha=%s, class_filter=%s\n",
+                    slot.st_params.sampler == SOFT_THINKING_SAMPLER_ENTROPY_PRESERVING ?
+                        "entropy-preserving" : "top-k",
+                    slot.st_params.adaptive_alpha ? "adaptive" : "static",
+                    slot.st_params.class_filtering ? "on" : "off (smudge)");
+            }
+
             slot.reset();
 
             slots.push_back(std::move(slot));
@@ -1161,6 +1201,14 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        // Activate soft thinking if enabled globally and task needs sampling
+        if (slot.st_params.enabled && slot.task->need_sampling()) {
+            slot.soft_thinking_active = true;
+            slot.st_ctx.state = soft_thinking_state::THINKING;
+            slot.st_ctx.low_entropy_count = 0;
+            SLT_INF(slot, "soft thinking activated for task%s", "");
+        }
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
@@ -2069,8 +2117,42 @@ private:
                     }
                     slot.drafted = std::move(draft);
                 }
+            } else if (slot.soft_embd != nullptr) {
+                // Soft thinking mode: decode embedding immediately
+                // Cannot batch embeddings with discrete tokens, so decode separately
+                const int n_embd = llama_model_n_embd(model);
+
+                llama_batch embd_batch = soft_thinking_prepare_batch(
+                    slot.soft_embd,
+                    n_embd,
+                    slot.prompt.tokens.pos_next(),
+                    slot.id
+                );
+
+                // Decode the embedding batch immediately
+                const int ret = llama_decode(ctx, embd_batch);
+                llama_batch_free(embd_batch);
+
+                if (ret != 0) {
+                    SLT_ERR(slot, "soft thinking: failed to decode embedding batch, ret = %d\n", ret);
+                    slot.release();
+                    continue;
+                }
+
+                // Track position for the soft token (use sampled token ID as placeholder)
+                slot.prompt.tokens.push_back(slot.sampled);
+
+                // Mark that we've decoded a soft embedding and need immediate sampling
+                slot.soft_embd_decoded = true;
+                slot.i_batch = -1;  // Not part of normal batch
+
+                SLT_DBG(slot, "soft thinking: decoded embedding, n_ctx = %d, n_tokens = %d\n",
+                        slot.n_ctx, slot.prompt.n_tokens());
+
+                // Clear the soft embedding pointer
+                slot.soft_embd = nullptr;
             } else {
-                // no speculative decoding
+                // no speculative decoding, normal discrete token
                 slot.i_batch = batch.n_tokens;
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2581,7 +2663,16 @@ private:
             llama_set_embeddings(ctx, slot_batched->task->need_embd());
         }
 
-        if (batch.n_tokens == 0) {
+        // Check if any slots need sampling due to soft embedding decode
+        bool has_soft_embd_decoded = false;
+        for (auto & slot : slots) {
+            if (slot.soft_embd_decoded) {
+                has_soft_embd_decoded = true;
+                break;
+            }
+        }
+
+        if (batch.n_tokens == 0 && !has_soft_embd_decoded) {
             SRV_WRN("%s", "no tokens to decode\n");
         }
 
@@ -2691,7 +2782,16 @@ private:
                     }
                 }
 
-                if (slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
+                // Check if slot needs sampling:
+                // - Either it's in the current batch range, or
+                // - We just decoded a soft embedding for it (soft_embd_decoded flag)
+                bool needs_sampling = (slot.i_batch >= (int) i && slot.i_batch < (int) (i + n_tokens));
+                if (!needs_sampling && slot.soft_embd_decoded) {
+                    // Soft embedding was decoded separately, needs sampling now
+                    needs_sampling = true;
+                    slot.soft_embd_decoded = false;  // Clear the flag
+                }
+                if (!needs_sampling) {
                     continue; // continue loop of slots
                 }
 
@@ -2727,13 +2827,68 @@ private:
                     continue; // sample using speculative decoding
                 }
 
-                const int tok_idx = slot.i_batch - i;
+                // For soft embedding decode, logits are at position 0 (batch of 1)
+                // For normal batch, calculate relative position
+                const int tok_idx = (slot.i_batch < 0) ? 0 : (slot.i_batch - i);
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                llama_token id;
+                slot.soft_embd = nullptr;  // Reset soft embedding pointer
+
+                // Soft thinking mode
+                if (slot.st_params.enabled && slot.soft_thinking_active &&
+                    slot.st_ctx.state == soft_thinking_state::THINKING) {
+
+                    // Soft sample with adaptive cointegration (entropy feedback control)
+                    soft_token st = soft_thinking_sample_cointegrated(slot.smpl.get(), ctx, slot.st_ctx, slot.st_params, tok_idx);
+                    id = st.top_id;  // Use top token for display
+
+                    // Check Cold Stop condition
+                    bool should_stop = soft_thinking_check_cold_stop(slot.st_ctx, slot.st_params, st.entropy);
+
+                    // Check for end-of-thinking tokens
+                    const llama_vocab * vocab = llama_model_get_vocab(model);
+                    bool is_end_token = false;
+
+                    if (llama_vocab_is_eog(vocab, st.top_id)) {
+                        is_end_token = true;
+                    }
+
+                    if (!is_end_token) {
+                        const char * token_text = llama_vocab_get_text(vocab, st.top_id);
+                        if (token_text != nullptr) {
+                            if (strcmp(token_text, "<|end|>") == 0 ||
+                                strcmp(token_text, "</think>") == 0 ||
+                                strcmp(token_text, "<|end_of_thought|>") == 0 ||
+                                strcmp(token_text, "</reasoning>") == 0) {
+                                is_end_token = true;
+                            }
+                        }
+                    }
+
+                    if (is_end_token) {
+                        SLT_INF(slot, "soft thinking: end token detected, transitioning to ANSWERING%s", "");
+                        slot.st_ctx.state = soft_thinking_state::ANSWERING;
+                    } else if (should_stop) {
+                        SLT_INF(slot, "soft thinking: cold stop triggered, transitioning to ANSWERING%s", "");
+                        slot.st_ctx.state = soft_thinking_state::ANSWERING;
+                    }
+
+                    // If still in thinking mode, compute soft embedding with sharpening (Fix 3)
+                    if (slot.st_ctx.state == soft_thinking_state::THINKING) {
+                        slot.soft_embd = soft_thinking_compute_embedding(slot.st_ctx, model, st, slot.st_params);
+                    }
+                } else {
+                    // Normal discrete sampling
+                    id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                }
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl.get(), id, true);
+                // Only accept token into sampler state during ANSWERING mode
+                // During THINKING, the model consumes weighted embeddings, not discrete tokens
+                if (!slot.st_params.enabled || slot.st_ctx.state != soft_thinking_state::THINKING) {
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                }
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
@@ -2822,6 +2977,103 @@ private:
                 }
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+            }
+        }
+
+        // Process slots that had soft embeddings decoded separately
+        // This handles the case where batch.n_tokens == 0 but we decoded soft embeddings
+        for (auto & slot : slots) {
+            if (!slot.soft_embd_decoded) {
+                continue;
+            }
+
+            slot.soft_embd_decoded = false;  // Clear the flag
+
+            if (slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+
+            // Soft embedding was decoded, now sample from the logits
+            llama_token id;
+            slot.soft_embd = nullptr;
+
+            if (slot.st_params.enabled && slot.soft_thinking_active &&
+                slot.st_ctx.state == soft_thinking_state::THINKING) {
+
+                // Soft sample with adaptive cointegration (entropy feedback control)
+                soft_token st = soft_thinking_sample_cointegrated(slot.smpl.get(), ctx, slot.st_ctx, slot.st_params, 0);
+                id = st.top_id;
+
+                // Check Cold Stop condition
+                bool should_stop = soft_thinking_check_cold_stop(slot.st_ctx, slot.st_params, st.entropy);
+
+                // Check for end-of-thinking tokens
+                const llama_vocab * vocab = llama_model_get_vocab(model);
+                bool is_end_token = false;
+
+                if (llama_vocab_is_eog(vocab, st.top_id)) {
+                    is_end_token = true;
+                }
+
+                if (!is_end_token) {
+                    const char * token_text = llama_vocab_get_text(vocab, st.top_id);
+                    if (token_text != nullptr) {
+                        if (strcmp(token_text, "<|end|>") == 0 ||
+                            strcmp(token_text, "</think>") == 0 ||
+                            strcmp(token_text, "<|end_of_thought|>") == 0 ||
+                            strcmp(token_text, "</reasoning>") == 0) {
+                            is_end_token = true;
+                        }
+                    }
+                }
+
+                if (is_end_token) {
+                    SLT_INF(slot, "soft thinking: end token detected, transitioning to ANSWERING%s", "");
+                    slot.st_ctx.state = soft_thinking_state::ANSWERING;
+                } else if (should_stop) {
+                    SLT_INF(slot, "soft thinking: cold stop triggered, transitioning to ANSWERING%s", "");
+                    slot.st_ctx.state = soft_thinking_state::ANSWERING;
+                }
+
+                // If still in thinking mode, compute soft embedding with sharpening (Fix 3)
+                if (slot.st_ctx.state == soft_thinking_state::THINKING) {
+                    slot.soft_embd = soft_thinking_compute_embedding(slot.st_ctx, model, st, slot.st_params);
+                }
+            } else {
+                // Normal discrete sampling - use logits at position 0
+                id = common_sampler_sample(slot.smpl.get(), ctx, 0);
+            }
+
+            slot.i_batch = -1;
+
+            // Only accept token into sampler state during ANSWERING mode
+            // During THINKING, the model consumes weighted embeddings, not discrete tokens
+            if (!slot.st_params.enabled || slot.st_ctx.state != soft_thinking_state::THINKING) {
+                common_sampler_accept(slot.smpl.get(), id, true);
+            }
+
+            const int64_t t_current = ggml_time_us();
+            slot.n_decoded += 1;
+
+            if (slot.n_decoded == 1) {
+                slot.t_start_generation = t_current;
+                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                metrics.on_prompt_eval(slot);
+            }
+
+            slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+            completion_token_output result;
+            result.tok          = id;
+            result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
+            result.prob         = 1.0f;
+
+            if (!process_token(result, slot)) {
+                slot.print_timings();
+                send_final_response(slot);
+                metrics.on_prediction(slot);
+                slot.release();
+                continue;
             }
         }
 

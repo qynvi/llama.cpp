@@ -3,6 +3,7 @@
 #include "console.h"
 #include "log.h"
 #include "sampling.h"
+#include "soft_thinking.h"
 #include "llama.h"
 #include "chat.h"
 
@@ -199,6 +200,49 @@ int main(int argc, char ** argv) {
     }
 
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
+
+    // Initialize soft thinking context if enabled
+    soft_thinking_params st_params;
+    soft_thinking_context st_ctx;
+
+    if (params.soft_thinking) {
+        st_params.enabled = true;
+        st_params.sampler = params.soft_thinking_sampler;
+        st_params.top_k = params.soft_thinking_top_k;
+        st_params.entropy_frac = params.soft_thinking_entropy_frac;
+        st_params.min_k = params.soft_thinking_min_k;
+        st_params.max_k = params.soft_thinking_max_k;
+        st_params.entropy_threshold = params.soft_thinking_entropy_thr;
+        st_params.cold_stop_steps = params.soft_thinking_cold_steps;
+        // Mixture sharpening params (Fix 3) - adaptive by default
+        st_params.adaptive_alpha = params.soft_thinking_adaptive_alpha;
+        st_params.alpha_low = params.soft_thinking_alpha_low;
+        st_params.alpha_high = params.soft_thinking_alpha_high;
+        // Token class filtering params (Fix 4) - enabled by default
+        st_params.class_filtering = params.soft_thinking_class_filter;
+
+        soft_thinking_init(st_ctx, model, st_params);
+
+        LOG_INF("Soft Thinking enabled:\n");
+        if (st_params.sampler == SOFT_THINKING_SAMPLER_TOP_K) {
+            LOG_INF("  sampler: top-k\n");
+            LOG_INF("  top_k: %d\n", st_params.top_k);
+        } else {
+            LOG_INF("  sampler: entropy-preserving\n");
+            LOG_INF("  entropy_frac: %.2f\n", st_params.entropy_frac);
+            LOG_INF("  min_k: %d\n", st_params.min_k);
+            LOG_INF("  max_k: %d\n", st_params.max_k);
+        }
+        LOG_INF("  entropy_threshold: %.3f\n", st_params.entropy_threshold);
+        LOG_INF("  cold_stop_steps: %d\n", st_params.cold_stop_steps);
+        if (st_params.adaptive_alpha) {
+            LOG_INF("  alpha: adaptive (%.2f-%.2f based on entropy)\n", st_params.alpha_low, st_params.alpha_high);
+        } else {
+            LOG_INF("  alpha: static (%.2f)\n", st_params.alpha_high);
+        }
+        LOG_INF("  class_filtering: %s\n", st_params.class_filtering ? "enabled" : "disabled (smudge)");
+        LOG_INF("  end detection: model-agnostic (control tokens)\n");
+    }
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
     const int n_ctx = llama_n_ctx(ctx);
@@ -532,6 +576,10 @@ int main(int argc, char ** argv) {
     bool input_echo    = true;
     bool display       = true;
 
+    // Soft thinking state for embedding-based decode
+    bool use_soft_embd_next = false;
+    std::vector<float> soft_embd_buffer;
+
     int n_past             = 0;
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
@@ -682,9 +730,33 @@ int main(int argc, char ** argv) {
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
-                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
-                    LOG_ERR("%s : failed to eval\n", __func__);
-                    return 1;
+                // Check if we should use soft embedding for single-token decode
+                if (use_soft_embd_next && n_eval == 1 && i == 0 && !soft_embd_buffer.empty()) {
+                    // Soft Thinking: use weighted embedding instead of token
+                    const int n_embd = llama_model_n_embd(model);
+                    llama_batch batch = soft_thinking_prepare_batch(
+                        soft_embd_buffer.data(), n_embd, n_past, 0);
+
+                    static int soft_embd_count = 0;
+                    soft_embd_count++;
+                    if (soft_embd_count % 50 == 1) {
+                        LOG_INF("[soft-think] Using soft embedding #%d at pos %d\n", soft_embd_count, n_past);
+                    }
+
+                    if (llama_decode(ctx, batch)) {
+                        llama_batch_free(batch);
+                        LOG_ERR("%s : failed to eval soft embedding\n", __func__);
+                        return 1;
+                    }
+
+                    llama_batch_free(batch);
+                    use_soft_embd_next = false;
+                    soft_embd_buffer.clear();
+                } else {
+                    if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
+                        LOG_ERR("%s : failed to eval\n", __func__);
+                        return 1;
+                    }
                 }
 
                 n_past += n_eval;
@@ -713,13 +785,105 @@ int main(int argc, char ** argv) {
                 LOG_DBG("saved session to %s\n", path_session.c_str());
             }
 
-            const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            llama_token id = LLAMA_TOKEN_NULL;
+            bool use_soft_embedding = false;
+            float * soft_embd = nullptr;
 
-            common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+            // Soft Thinking mode
+            if (params.soft_thinking && st_ctx.state == soft_thinking_state::THINKING) {
+                // Soft sample with adaptive cointegration (entropy feedback control)
+                soft_token st = soft_thinking_sample_cointegrated(smpl, ctx, st_ctx, st_params, -1);
+
+                // Display top token for readability
+                id = st.top_id;
+
+                // Debug: show entropy and top-k info periodically
+                static int soft_step = 0;
+                soft_step++;
+                if (soft_step % 50 == 1) {  // Every 50 steps
+                    LOG_INF("[soft-think step %d] entropy=%.4f, top_id=%d, low_entropy_count=%d\n",
+                            soft_step, st.entropy, st.top_id, st_ctx.low_entropy_count);
+                }
+
+                // Check Cold Stop condition (entropy-based transition)
+                bool should_stop = soft_thinking_check_cold_stop(st_ctx, st_params, st.entropy);
+
+                // Check for end-of-thinking tokens
+                const llama_vocab * vocab = llama_model_get_vocab(model);
+                bool is_end_token = false;
+
+                // Check EOG tokens first
+                if (llama_vocab_is_eog(vocab, st.top_id)) {
+                    is_end_token = true;
+                }
+
+                // Check token text for common end-of-thinking markers
+                if (!is_end_token) {
+                    const char * token_text = llama_vocab_get_text(vocab, st.top_id);
+                    if (token_text != nullptr) {
+                        // Match common end tokens: <|end|>, </think>, </reasoning>, etc.
+                        if (strcmp(token_text, "<|end|>") == 0 ||
+                            strcmp(token_text, "</think>") == 0 ||
+                            strcmp(token_text, "<|end_of_thought|>") == 0 ||
+                            strcmp(token_text, "</reasoning>") == 0) {
+                            is_end_token = true;
+                        }
+                    }
+                }
+
+                if (is_end_token) {
+                    should_stop = true;
+                    LOG_INF("[soft-think] End token detected (id=%d, text='%s') at step %d\n",
+                            st.top_id, llama_vocab_get_text(vocab, st.top_id), soft_step);
+                }
+
+                if (should_stop) {
+                    // Transition to ANSWERING mode
+                    st_ctx.state = soft_thinking_state::ANSWERING;
+                    use_soft_embd_next = false;
+                    soft_embd_buffer.clear();
+                    if (is_end_token) {
+                        // Use the end token the model predicted
+                        id = st.top_id;
+                        LOG_INF("[soft-think] Switching to ANSWERING mode at step %d\n", soft_step);
+                    } else {
+                        // Cold Stop: use standard sampling for first answer token
+                        LOG_INF("[soft-think] Cold Stop at step %d, entropy converged - switching to ANSWERING\n", soft_step);
+                        id = common_sampler_sample(smpl, ctx, -1);
+                    }
+                } else {
+                    // Continue soft thinking - compute weighted embedding with sharpening (Fix 3)
+                    soft_embd = soft_thinking_compute_embedding(st_ctx, model, st, st_params);
+                    use_soft_embedding = true;
+                }
+            }
+
+            // Standard discrete sampling (ANSWERING mode or non-soft-thinking)
+            if (!params.soft_thinking || st_ctx.state == soft_thinking_state::ANSWERING) {
+                if (id == LLAMA_TOKEN_NULL) {
+                    id = common_sampler_sample(smpl, ctx, -1);
+                }
+            }
+
+            // Only accept token into sampler state during ANSWERING mode
+            // During THINKING, the model consumes weighted embeddings, not discrete tokens
+            if (!params.soft_thinking || st_ctx.state != soft_thinking_state::THINKING) {
+                common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+            }
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
-            embd.push_back(id);
+            if (use_soft_embedding && soft_embd != nullptr) {
+                // For soft thinking: store the weighted embedding for next decode
+                const int n_embd = llama_model_n_embd(model);
+                soft_embd_buffer.assign(soft_embd, soft_embd + n_embd);
+                use_soft_embd_next = true;
+
+                // Still add the top token to embd for display purposes
+                embd.push_back(id);
+            } else {
+                embd.push_back(id);
+            }
 
             if (params.conversation_mode && !waiting_for_first_input && !llama_vocab_is_eog(vocab, id)) {
                 assistant_ss << common_token_to_piece(ctx, id, false);

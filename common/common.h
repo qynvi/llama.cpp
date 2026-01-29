@@ -136,6 +136,12 @@ enum common_conversation_mode {
     COMMON_CONVERSATION_MODE_AUTO     = 2,
 };
 
+// soft thinking sampler types
+enum soft_thinking_sampler_type {
+    SOFT_THINKING_SAMPLER_TOP_K             = 0,
+    SOFT_THINKING_SAMPLER_ENTROPY_PRESERVING = 1,
+};
+
 enum common_grammar_trigger_type {
     COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN,
     COMMON_GRAMMAR_TRIGGER_TYPE_WORD,
@@ -598,6 +604,24 @@ struct common_params {
     std::string cvector_negative_file = "tools/cvector-generator/negative.txt";
 
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
+
+    // soft thinking params (for continuous concept space reasoning)
+    bool        soft_thinking                      = false;  // enable soft thinking
+    soft_thinking_sampler_type soft_thinking_sampler = SOFT_THINKING_SAMPLER_ENTROPY_PRESERVING;  // sampler type
+    int         soft_thinking_top_k                = 15;     // number of top tokens for concept token (top-k sampler)
+    float       soft_thinking_entropy_thr          = 0.1f;   // entropy threshold for Cold Stop
+    int         soft_thinking_cold_steps           = 256;    // consecutive low-entropy steps for Cold Stop
+    // entropy-preserving sampler params
+    float       soft_thinking_entropy_frac         = 0.90f;  // fraction of entropy to preserve (0.0-1.0)
+    int         soft_thinking_min_k                = 3;      // minimum tokens in concept
+    int         soft_thinking_max_k                = 50;     // maximum tokens in concept
+    // Note: end detection is model-agnostic via llama_vocab_is_control()
+    // mixture sharpening params (Fix 3) - adaptive by default
+    bool        soft_thinking_adaptive_alpha       = true;   // vary alpha based on entropy (default: on)
+    float       soft_thinking_alpha_low            = 1.0f;   // alpha when high entropy (softer)
+    float       soft_thinking_alpha_high           = 2.5f;   // alpha when low entropy (sharper)
+    // token class filtering params (Fix 4) - enabled by default
+    bool        soft_thinking_class_filter         = true;   // enable token class filtering for code/math
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;

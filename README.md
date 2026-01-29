@@ -1,14 +1,137 @@
-# llama.cpp
+# llama.cpp + Soft Thinking
+
+> **This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with experimental Soft Thinking support.**
+>
+> Soft Thinking enables continuous concept-space reasoning during the "thinking" phase of generation, potentially improving reasoning quality by preserving uncertainty rather than committing to discrete tokens prematurely.
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+[![Upstream](https://img.shields.io/badge/upstream-llama.cpp-blue)](https://github.com/ggml-org/llama.cpp)
 
 [Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
 
 LLM inference in C/C++
+
+---
+
+## Soft Thinking
+
+Soft Thinking is an experimental feature that modifies how tokens are generated during the model's "thinking" or reasoning phase. Instead of sampling a single discrete token at each step, Soft Thinking:
+
+1. **Samples a "concept token"** - a probability-weighted combination of the most likely tokens
+2. **Computes a weighted embedding** - blends the embeddings of these tokens according to their probabilities
+3. **Feeds the blended embedding** back into the model for the next step
+
+This allows the model to maintain uncertainty and explore multiple reasoning paths simultaneously, rather than committing to a single token that might foreclose better options.
+
+### How It Works
+
+```
+Traditional Sampling:          Soft Thinking:
+
+  logits → argmax → token     logits → top-k → weighted embedding
+     ↓                              ↓
+  embed(token)                 Σ p_i × embed(token_i)
+     ↓                              ↓
+  next step                    next step
+```
+
+The model transitions from Soft Thinking to normal discrete sampling when:
+- A **Cold Stop** is triggered (sustained low entropy indicates confident generation)
+- An **end-of-thinking token** is detected (`</think>`, `</reasoning>`, etc.)
+
+### Adaptive Concept Width (Entropy-Preserving Sampler)
+
+By default, Soft Thinking uses a novel **entropy-preserving sampler** that dynamically sizes the concept token to capture a target fraction of the model's uncertainty:
+
+- At **decision points** (high entropy): wider concepts preserve more alternatives
+- At **deterministic steps** (low entropy): narrower concepts for stability collapses to near-discrete representation
+
+This is more information-theoretically principled than a fixed top-k, as it adapts to the actual probability distribution, reducing noise and the risk of OOD (Out-Of-Distribution) collapse in the inference pass, thus generalizing against different models or quantized models as it stabilizes the concept space based on internal feedback.
+
+### Usage
+
+#### llama-cli
+
+```bash
+llama-cli \
+    --model model.gguf \
+    --soft-thinking \
+    -p "Solve this step by step: What is 23 × 47?"
+```
+
+#### llama-server
+
+```bash
+llama-server \
+    --model model.gguf \
+    --soft-thinking \
+    --port 8080
+```
+
+> **Note:** The server runs in single-slot mode when soft thinking is enabled.
+
+#### llama-completion
+
+```bash
+llama-completion \
+    --model model.gguf \
+    --soft-thinking \
+    -p "<|begin_of_thought|>Let me think about this..."
+```
+
+### Configuration Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--soft-thinking` | off | Enable soft thinking mode |
+| `--soft-thinking-sampler` | `entropy-preserving` | Sampler type: `entropy-preserving` or `top-k` |
+| `--soft-thinking-entropy-frac` | 0.90 | Fraction of entropy to preserve (entropy-preserving sampler) |
+| `--soft-thinking-min-k` | 3 | Minimum tokens in concept |
+| `--soft-thinking-max-k` | 50 | Maximum tokens in concept |
+| `--soft-thinking-top-k` | 15 | Fixed concept width (top-k sampler only) |
+| `--soft-thinking-entropy` | 0.10 | Cold Stop entropy threshold |
+| `--soft-thinking-cold-steps` | 256 | Consecutive low-entropy steps for Cold Stop |
+
+### Best Practices
+
+1. **Use with reasoning models**: Soft Thinking only works with models that emit thinking tokens before the output pass.
+
+2. **Tune entropy fraction**: Recommend 0.85-0.95 for most models.
+
+3. **Works best with longer reasoning**: Initial experiments show greater benefit for longer reasoning and for smaller models.
+
+### Future Work
+
+1. **GGML Graph Integration**: Better GPU acceleration for the algorithm.
+
+2. **Algo Improvements**: Incorporate or design other deep test time model improvements.
+
+3. **Speculative/Contrastive Concept Exploration**: Design ways to draft or filter the concept token to sharpen the continuous concept space.
+
+### Docker
+
+Build with soft thinking support:
+
+```bash
+docker build -t llama-soft:server --target server -f .devops/blackwell.Dockerfile .
+
+# Run
+docker run --gpus all -p 8080:8080 -v /path/to/models:/models \
+    llama-soft:server \
+    --model /models/your-model.gguf \
+    --soft-thinking
+```
+
+### References
+
+- Based on concepts from "Soft Thinking" research on continuous concept-space reasoning
+- Entropy-preserving width adapts ideas from nucleus sampling to the soft thinking context
+
+---
+
+## Original llama.cpp Documentation
 
 ## Recent API changes
 

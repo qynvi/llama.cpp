@@ -83,6 +83,8 @@ add_library(${TARGET} STATIC
     regex-partial.h
     sampling.cpp
     sampling.h
+    soft_thinking.cpp
+    soft_thinking.h
     speculative.cpp
     speculative.h
     unicode.cpp
@@ -102,6 +104,7 @@ add_library(${TARGET} STATIC
     )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PRIVATE ../src)  # For soft_thinking.cpp access to llama-model.h
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

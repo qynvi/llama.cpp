@@ -3782,6 +3782,109 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    // Soft Thinking arguments (continuous concept space reasoning)
+    add_opt(common_arg(
+        {"--soft-thinking"},
+        "enable Soft Thinking for continuous concept space reasoning",
+        [](common_params & params) {
+            params.soft_thinking = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-sampler"}, "TYPE",
+        "soft thinking sampler: top-k, entropy-preserving (default: entropy-preserving)",
+        [](common_params & params, const std::string & value) {
+            if (value == "top-k" || value == "top_k") {
+                params.soft_thinking_sampler = SOFT_THINKING_SAMPLER_TOP_K;
+            } else if (value == "entropy-preserving" || value == "entropy_preserving") {
+                params.soft_thinking_sampler = SOFT_THINKING_SAMPLER_ENTROPY_PRESERVING;
+            } else {
+                throw std::invalid_argument("invalid soft thinking sampler type: " + value);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-top-k"}, "N",
+        string_format("number of top tokens for concept token, top-k sampler only (default: %d)", params.soft_thinking_top_k),
+        [](common_params & params, int value) {
+            params.soft_thinking_top_k = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-entropy-frac"}, "F",
+        string_format("fraction of entropy to preserve, entropy-preserving sampler (default: %.2f)", params.soft_thinking_entropy_frac),
+        [](common_params & params, const std::string & value) {
+            params.soft_thinking_entropy_frac = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-min-k"}, "N",
+        string_format("minimum tokens in concept, entropy-preserving sampler (default: %d)", params.soft_thinking_min_k),
+        [](common_params & params, int value) {
+            params.soft_thinking_min_k = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-max-k"}, "N",
+        string_format("maximum tokens in concept, entropy-preserving sampler (default: %d)", params.soft_thinking_max_k),
+        [](common_params & params, int value) {
+            params.soft_thinking_max_k = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-entropy"}, "T",
+        string_format("entropy threshold for Cold Stop (default: %.2f)", params.soft_thinking_entropy_thr),
+        [](common_params & params, const std::string & value) {
+            params.soft_thinking_entropy_thr = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-cold-steps"}, "N",
+        string_format("consecutive low-entropy steps for Cold Stop (default: %d)", params.soft_thinking_cold_steps),
+        [](common_params & params, int value) {
+            params.soft_thinking_cold_steps = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    // Note: --soft-thinking-end-token removed - detection is now model-agnostic via llama_vocab_is_control()
+    add_opt(common_arg(
+        {"--soft-thinking-static-alpha"}, "F",
+        string_format("use static alpha exponent instead of adaptive (default: adaptive %.1f-%.1f)",
+            params.soft_thinking_alpha_low, params.soft_thinking_alpha_high),
+        [](common_params & params, const std::string & value) {
+            params.soft_thinking_adaptive_alpha = false;  // Disable adaptive mode
+            float static_exp = std::stof(value);
+            params.soft_thinking_alpha_low = static_exp;
+            params.soft_thinking_alpha_high = static_exp;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-adaptive-alphas"}, "LOW,HIGH",
+        string_format("set adaptive alpha range (default: %.1f,%.1f; low when uncertain, high when confident)",
+            params.soft_thinking_alpha_low, params.soft_thinking_alpha_high),
+        [](common_params & params, const std::string & value) {
+            // Parse comma-separated pair: low,high
+            std::vector<std::string> parts;
+            std::stringstream ss(value);
+            std::string part;
+            while (std::getline(ss, part, ',')) {
+                parts.push_back(part);
+            }
+            if (parts.size() != 2) {
+                throw std::invalid_argument("--soft-thinking-adaptive-alphas requires 2 comma-separated values: low,high");
+            }
+            params.soft_thinking_adaptive_alpha = true;  // Ensure adaptive mode is on
+            params.soft_thinking_alpha_low = std::stof(parts[0]);
+            params.soft_thinking_alpha_high = std::stof(parts[1]);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--soft-thinking-smudge-tokens"},
+        "disable token class filtering (allow mixing across token classes like operators and identifiers)",
+        [](common_params & params) {
+            params.soft_thinking_class_filter = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+
     return ctx_arg;
 }
 
